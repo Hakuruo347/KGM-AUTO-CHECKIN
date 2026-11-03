@@ -4,9 +4,11 @@ import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } fr
 import { sendNotify } from "./utils/notify.js";
 import { close_api, delay, send, startService, waitForApi } from "./utils/utils.js";
 import { writeUserinfoFile, parseUserinfoJson } from "./utils/userinfo.js";
+import { buildDeviceCookie, migrateUserinfoDevice } from "./utils/device.js";
 import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
 import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
-import { mergeVipExpiries, readCheckinStatus, writeCheckinStatus } from "./utils/checkinStatus.js";
+import { mergeInvalidCreds, mergeVipExpiries, readCheckinStatus, writeCheckinStatus } from "./utils/checkinStatus.js";
+import { sendInvalidCredentialNotices } from "./utils/mailNotice.js";
 
 /**
  * 读取进程 stdin 的全部内容（用于从父进程安全接收凭据）。
@@ -50,6 +52,10 @@ async function main() {
     throw new Error("未配置或 USERINFO 格式错误（应为 [{\"userid\":\"...\",\"token\":\"...\"}]）")
   }
 
+  // 存量账号兜底迁移：缺设备标识的条目补全局固定值（与 WebUI 启动迁移同一套幂等逻辑；
+  // GitHub Actions 直接读 Secret、不经 WebUI，所以这里也执行一次）
+  migrateUserinfoDevice(userinfo)
+
   // 启动服务并等待就绪（避免冷启动竞态导致首个请求失败）
   const api = startService()
   try {
@@ -82,6 +88,10 @@ async function main() {
   const notifyResults = []
   // userid -> VIP 到期时间（仅 WebUI 模式：设置 CHECKIN_STATUS_FILE 时收集并写盘）
   const vipExpiries = {}
+  // 本轮判定为「凭据失效」的账号（增量）：userid -> 失效日期；值为 null 表示本轮已恢复正常、需从文件里清除
+  const invalidCreds = {}
+  // 供日志与通知汇总的失效账号（按发现顺序），让用户一眼看出「该重新登录哪几个」
+  const invalidCredList = []
   let hasError = false
 
   // 单账号完整签到流程：并行时各账号独立执行，账号内部保持原有请求节奏（VIP 领取间隔 30s）
@@ -100,7 +110,7 @@ async function main() {
         // 仅当该账号的到期时间不是今天查到的时候才补一次。
         if (statusFile && vipExpiryAt[String(user.userid)] !== date) {
           try {
-            const headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+            const headers = { 'cookie': buildDeviceCookie(user, 'token=' + user.token + '; userid=' + user.userid) }
             const vipInfo = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
             const end = vipInfo?.status === 1 && Array.isArray(vipInfo.data?.busi_vip) && vipInfo.data.busi_vip.length > 0
               ? vipInfo.data.busi_vip[0].vip_end_time
@@ -119,21 +129,35 @@ async function main() {
 
       // 单账号异常隔离：任何一个账号的请求/解析出错，只记录该账号失败，不影响其余账号继续执行
       try {
-        let headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+        let headers = { 'cookie': buildDeviceCookie(user, 'token=' + user.token + '; userid=' + user.userid) }
         const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
         if (userDetail?.data?.nickname == null) {
           const safeUserId = maskIdentifier(user.userid)
-          printRed(`${tag} token过期或账号不存在, userid: ${safeUserId}`)
+          // 区分「凭据真的失效」与「瞬时拒绝」：
+          //   20018 = 酷狗明确判定 token 失效/账号不存在 → 只能重新登录，写入状态文件供面板提示；
+          //   其它（如 20006）= 限流/风控类瞬时拒绝，同一 token 稍后重试即可成功，不能标记失效，
+          //   否则面板会误报「需重新登录」（实测 481***56 本轮 20006，随后连测 3 次全部正常）。
+          const credentialInvalid = userDetail?.error_code === 20018
+          const reason = credentialInvalid
+            ? '登录凭据已失效，需重新登录'
+            : `获取账号信息失败（error_code ${userDetail?.error_code ?? '未知'}）`
+          printRed(`${tag} ${reason}, userid: ${safeUserId}`)
           accountErrors[safeUserId] = {
-            msg: `token过期或账号不存在, userid: ${safeUserId}`,
+            msg: `${reason}, userid: ${safeUserId}`,
             data: summarizeResponse(userDetail)
           }
+          if (credentialInvalid) {
+            invalidCreds[String(user.userid)] = date
+            invalidCredList.push(safeUserId)
+          }
           return {
-            nickname: safeUserId, status: '失败', listen: '账号不存在',
-            vipClaim: '0/8', vipExpiry: '未知', error: 'token过期或账号不存在'
+            nickname: safeUserId, status: '失败', listen: credentialInvalid ? '凭据失效' : '账号信息获取失败',
+            vipClaim: '0/8', vipExpiry: '未知', error: reason
           }
         }
         const safeNickname = maskDisplayName(userDetail.data.nickname)
+        // 本轮拿到昵称说明凭据可用：清除可能残留的「凭据失效」标记（值为 null = 删除）
+        invalidCreds[String(user.userid)] = null
         printMagenta(`${tag} 账号 ${safeNickname} 开始签到`)
 
         // 周日刷新token
@@ -151,7 +175,7 @@ async function main() {
             printYellow(`${tag} 账号 ${safeNickname} 需要刷新token`)
             user.token = newToken
             // 用新 token 重建本次请求的 headers，使后续听歌/VIP 领取使用刷新后的凭证
-            headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+            headers = { 'cookie': buildDeviceCookie(user, 'token=' + user.token + '; userid=' + user.userid) }
           } else if (refreshToken?.status == 1 && !newToken) {
             // 刷新接口返回成功但没给有效 token：保持原 token 继续本次签到
             printYellow(`${tag} 账号 ${safeNickname} token 刷新响应缺少有效 token，已保留原 token`)
@@ -266,20 +290,28 @@ async function main() {
   }
 
   try {
-    // 并发数（账号级并行）：默认不限制——有几个账号就几路全部并行；
-    // CHECKIN_CONCURRENCY 可选限流：设 N = 最多 N 路，设 1 = 逐个串行（与旧版行为一致）
+    // 并发数（账号级并行）：默认按账号规模自适应——≤6 个账号全部并行；
+    // 超过 6 个时默认限 3 路（多账号同 IP 高并发易触发风控），并打日志提示。
+    // CHECKIN_CONCURRENCY 显式设置时优先：设 N = 最多 N 路（'max'/'0' = 不限），设 1 = 逐个串行。
     const rawConcurrency = String(process.env.CHECKIN_CONCURRENCY || '').trim().toLowerCase()
     let CONCURRENCY
-    if (!rawConcurrency || rawConcurrency === 'max' || rawConcurrency === '0') {
+    if (!rawConcurrency) {
+      CONCURRENCY = userinfo.length > 6 ? 3 : userinfo.length
+    } else if (rawConcurrency === 'max' || rawConcurrency === '0') {
       CONCURRENCY = userinfo.length
     } else {
       const n = parseInt(rawConcurrency, 10)
       CONCURRENCY = Math.min(Math.max(1, n || 1), Math.max(1, userinfo.length))
     }
     if (userinfo.length > 1) {
-      const source = (!rawConcurrency || rawConcurrency === 'max' || rawConcurrency === '0')
-        ? '全部账号同时并行'
-        : `限流 ${CONCURRENCY} 路（CHECKIN_CONCURRENCY，1 为逐个串行）`
+      let source
+      if (!rawConcurrency) {
+        source = userinfo.length > 6 ? '账号数 > 6，默认限流 3 路' : '全部账号同时并行'
+      } else if (rawConcurrency === 'max' || rawConcurrency === '0') {
+        source = '全部账号同时并行'
+      } else {
+        source = `限流 ${CONCURRENCY} 路（CHECKIN_CONCURRENCY，1 为逐个串行）`
+      }
       printYellow(`多账号并行签到：${CONCURRENCY} 个账号同时进行（${source}）`)
     }
 
@@ -307,11 +339,17 @@ async function main() {
   // 必须与文件里已有数据合并而不是整份覆盖：手动触发会跳过当日已签到的账号，
   // 被跳过的账号本轮不查询 VIP 详情，覆盖写会把之前（定时任务）写好的到期时间全部抹掉。
   if (statusFile) {
+    // 第三个参数 force：本轮只要产生了凭据状态变化（新标记或恢复正常）就必须落盘。
+    // 若恰好两个映射都为空（唯一账号恢复正常且拿不到 VIP 到期时间），
+    // 默认的「空则不写」会把旧标记留在文件里，面板就一直提示需重新登录。
+    const credentialChanged = Object.keys(invalidCreds).length > 0
     const result = writeCheckinStatus(statusFile, {
       date,
       vipExpiry: mergeVipExpiries(existingStatus.vipExpiry, vipExpiries),
+      // 凭据失效映射同样合并：本轮新判定的写入，本轮恢复正常的删除，没检查到的旧条目保留
+      invalidCreds: mergeInvalidCreds(existingStatus.invalidCreds, invalidCreds),
       vipExpiryAt,
-    })
+    }, credentialChanged)
     // 写盘失败不影响签到结果，但必须显式告警，否则面板会一直停在旧值
     if (!result.ok) printYellow(`警告：账号状态写入失败（${result.error}）`)
   }
@@ -362,6 +400,36 @@ async function main() {
     }
   }
 
+  // 凭据失效汇总：比逐条 error_code 更容易看出「该做什么」——这几个账号只能重新登录，
+  // 重跑签到不会恢复（酷狗已明确返回 20018）。放在通知之前打印，日志里一眼可见。
+  if (invalidCredList.length > 0) {
+    printRed(`⚠ ${invalidCredList.length} 个账号登录凭据已失效，需重新登录：${invalidCredList.join('、')}`)
+  }
+
+  // 按账号发送失效邮件：只发给「自己预留过邮箱并完成验证」的用户。
+  // 这里必须用完整 userinfo（而不是 processAccount 的返回值）来取邮箱，因为
+  // token 刷新的写回可能整体覆盖数组，邮箱信息只存在于当前内存里的 userinfo。
+  // 放在 allSkipped 提前 return 之前：手动重跑时全部账号跳过，但失效账号仍需要提醒。
+  const invalidUserids = new Set(Object.keys(invalidCreds).filter(id => invalidCreds[id] !== null))
+  if (invalidUserids.size > 0) {
+    const mailTargets = userinfo.filter(u => u && invalidUserids.has(String(u.userid)))
+    try {
+      const mailResult = await sendInvalidCredentialNotices(mailTargets, {
+        date,
+        siteHint: process.env.WEBUI_PUBLIC_URL || '',
+      })
+      if (mailResult.sent > 0 || mailResult.failed > 0) {
+        printYellow(`失效邮件：已发送 ${mailResult.sent} 封、失败 ${mailResult.failed} 封、冷却跳过 ${mailResult.skipped} 个、未绑定已验证邮箱 ${mailResult.invalid} 个`)
+      }
+      if (mailResult.warn === 'mail_notice_write_failed') {
+        printYellow('失效邮件发送记录写入失败，下次运行可能重复提醒同一账号')
+      }
+    } catch (e) {
+      // 邮件是附加通知：失败不应让整个签到任务判为失败
+      printYellow(`失效邮件提醒异常: ${e.message}`)
+    }
+  }
+
   // 构建通知内容（放在 secret 更新之后、错误抛出之前，确保始终执行）
   const skipCount = notifyResults.filter(r => r.status === '跳过').length
   const allSkipped = skippedCount > 0 && skippedCount === notifyResults.length
@@ -389,6 +457,9 @@ async function main() {
   const successCount = notifyResults.filter(r => r.status === '成功').length
   const failCount = notifyResults.length - successCount - skipCount
   content += `✅ 成功: ${successCount}  ⏭ 跳过: ${skipCount}  ❌ 失败: ${failCount}\n`
+  if (invalidCredList.length > 0) {
+    content += `⚠️ 需重新登录: ${invalidCredList.join('、')}\n`
+  }
 
   for (const r of notifyResults) {
     content += `\n【${r.nickname}】\n`
